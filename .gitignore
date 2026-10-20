@@ -1,0 +1,38 @@
+# Temporary files
+*.swp
+*.swo
+*~
+*.tmp
+
+# Build intermediate files
+*.o
+*.cmd
+*.mod.c
+
+# Downloaded archives
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+
+# Credentials and local secrets
+.env
+.env.*
+*.pem
+id_rsa
+id_ed25519
+**/etc/passwd
+**/etc/shadow
+**/etc/gshadow
+
+# Editor files
+.vscode/
+.idea/
+
+# Downloaded Lab 3 debugging tools
+lab03/tools/**/extracted/
+lab03/tools/**/*.deb
+
+# Downloaded debugging tools
+lab03/tools/**/extracted/
+lab03/tools/**/*.deb

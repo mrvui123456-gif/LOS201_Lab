@@ -1,0 +1,6 @@
+# LAB01-C3-01: Tao chuong trinh init ban dau
+cat > init << 'EOF'
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+exec /sbin/init

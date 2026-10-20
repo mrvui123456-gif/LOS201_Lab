@@ -1,0 +1,665 @@
+001 | EMBEDDED LINUX SYSTEMS
+002 |   LAB-03  
+003 | Debugging Kernel &
+004 | Phân tích Hiệu năng Ứng dụng Nhúng
+005 | GDB Remote Debug  |  Valgrind  |  strace / perf  |  cyclictest  |  RT Kernel
+009 | I. Mục tiêu bài lab
+010 | Sau khi hoàn thành bài lab này, sinh viên có khả năng:
+012 | Thực hiện remote debugging cho ứng dụng ARM chạy trong QEMU bằng GDB multiarch và gdbserver: đặt breakpoint, watchpoint, in biến, sửa bug.
+013 | Phát hiện và phân tích memory leak trong ứng dụng C nhúng bằng Valgrind, hiểu cơ chế heap và vòng đời bộ nhớ trong userspace.
+014 | Sử dụng strace để theo dõi system call và perf để xác định CPU hotspot, đọc và giải thích kết quả profiling.
+015 | Đo lường và so sánh latency giữa standard kernel và PREEMPT_RT kernel bằng cyclictest, phân tích kết quả định lượng.
+016 | Lựa chọn công cụ debug phù hợp với từng loại vấn đề: crash, memory leak, hiệu năng thấp, hay latency cao.
+018 | II. Kiến thức nền cần có
+019 | 2.1. Quản lý bộ nhớ trong Linux (Chapter 16)
+020 | Virtual memory: mỗi process có address space riêng, kernel space và user space được phân tách.
+021 | Heap management: malloc()/free() và vòng đời của heap allocation – fragmentation, leak.
+022 | Memory map của process: text, data, BSS, heap, stack, mmap regions – đọc /proc/PID/maps.
+023 | Memory leak: bộ nhớ được cấp phát nhưng không bao giờ được giải phóng, tích lũy dần theo thời gian.
+024 | Per-process memory: VSZ (Virtual Size) vs RSS (Resident Set Size) – sự khác biệt quan trọng.
+026 | 2.2. Development Tools (Chapter 17)
+027 | GDB (GNU Debugger): breakpoint, watchpoint, backtrace, print, x (examine memory), info registers.
+029 | strace: intercept và log tất cả system calls của một process, xem arguments và return values.
+030 | perf: Linux performance analysis tool – perf stat, perf record, perf report, flame graph.
+031 | Valgrind / memcheck: công cụ dynamic analysis phát hiện memory error, leak, invalid access.
+033 | 2.3. Kernel Debugging (Chapter 18)
+034 | Thách thức khi debug kernel: không có OS bên dưới để đỡ, crash là fatal, hạn chế về tool.
+035 | printk và dmesg: debug cơ bản bằng log message với log level (KERN_DEBUG, KERN_INFO, KERN_ERR).
+036 | KGDB: kernel GDB stub cho phép debug kernel qua serial hoặc network từ host GDB.
+037 | Oops và panic: cấu trúc của kernel crash dump, cách đọc backtrace từ kernel log.
+039 | 2.4. Linux và Real-Time (Chapter 19)
+040 | Real-time: đảm bảo deadline – hard RT (miss = system fail) vs soft RT (miss = degraded).
+041 | Kernel preemption: PREEMPT_NONE, PREEMPT_VOLUNTARY, PREEMPT (Desktop), PREEMPT_RT (Fully Preemptible).
+042 | PREEMPT_RT patch: chuyển hầu hết interrupt handler thành kernel thread, loại bỏ non-preemptible section.
+043 | cyclictest: đo worst-case latency bằng cách đo sai số giữa wake-up dự kiến và thực tế.
+046 | III. Chuẩn bị môi trường
+047 | 3.1. Điều kiện tiên quyết
+048 | Yêu cầu: Bài lab này dùng lại zImage từ LAB-01 và rootfs từ LAB-02. Sinh viên cần tạo thêm rootfs LAB-03 với các công cụ debug được thêm vào.
+050 | ls ~/embedded_lab1/output/zImage
+051 | ls ~/embedded_lab1/output/vexpress-v2p-ca9.dtb
+052 | # Hai file này dùng lại từ LAB-01
+054 | 3.2. Cài đặt công cụ trên Host
+055 | Cài GDB multiarch (hỗ trợ debug ARM từ host x86_64)
+056 | sudo apt install -y gdb-multiarch
+057 | gdb-multiarch --version
+058 | # Xác nhận: GNU gdb ... --target=arm-linux-gnueabihf (hoặc multiarch)
+060 | Cài Valgrind, strace, perf, và các công cụ phân tích
+061 | sudo apt install -y valgrind strace
+062 | sudo apt install -y linux-tools-common linux-tools-generic
+063 | # perf tool – phiên bản khớp với kernel host
+064 | sudo apt install -y rt-tests
+065 | # cyclictest nằm trong gói rt-tests
+066 | sudo apt install -y gnuplot
+067 | # Vẽ biểu đồ latency từ dữ liệu cyclictest
+069 | 3.3. Tạo cấu trúc thư mục LAB-03
+070 | mkdir -p ~/embedded_lab3/{apps,rootfs,output,logs,rt_kernel}
+071 | mkdir -p ~/embedded_lab3/rootfs/initramfs
+072 | # Sao chép rootfs từ LAB-02 làm nền
+073 | sudo cp -r ~/embedded_lab2/rootfs/initramfs/* ~/embedded_lab3/rootfs/initramfs/
+075 | 3.4. Build gdbserver cho ARM (cross-compiled)
+076 | gdbserver là binary chạy trên target ARM, nhận kết nối từ GDB host và điều khiển process được debug.
+078 | Phương án 1: Cài từ gói có sẵn (đơn giản nhất)
+079 | sudo apt install -y gdbserver
+080 | # Gói này thường chứa gdbserver cho nhiều arch
+081 | file /usr/bin/gdbserver
+082 | # Nếu là x86_64, cần build lại cho ARM (dùng phương án 2)
+084 | Phương án 2: Cross-compile gdbserver cho ARM
+085 | sudo apt install -y gdb-multiarch gdbserver
+086 | # Tìm gdbserver ARM trong toolchain:
+087 | find /usr -name 'gdbserver' 2>/dev/null
+088 | # Hoặc copy từ toolchain sysroot:
+089 | arm-linux-gnueabihf-gdb --version 2>/dev/null || true
+090 | # Nếu không có arm gdbserver, download từ linaro toolchain
+092 | Kiểm tra và copy vào rootfs
+093 | which gdbserver
+094 | file $(which gdbserver)
+095 | # Cần file ARM ELF, không phải x86_64
+096 | cp $(which gdbserver) ~/embedded_lab3/rootfs/initramfs/usr/bin/
+098 | 📌 Lưu ý: Nếu không tìm được gdbserver ARM, Phần A sẽ thực hiện debug trực tiếp trên host với QEMU user-mode thay vì system-mode. Giảng viên sẽ hướng dẫn thêm nếu cần.
+100 | 3.5. Tổng quan workflow debug trong bài lab
+102 | ┌─────────── HOST (x86_64 Ubuntu) ──────────────────────────────┐
+103 | │  gdb-multiarch  │  valgrind  │  strace  │  perf  │  cyclictest│
+104 | │       ↕ TCP:1234 (remote debug)                               │
+105 | └────────────────────────── QEMU ───────────────────────────────┘
+106 |          ↕ -net user,hostfwd=tcp::1234-:1234
+107 | ┌─────────── TARGET (ARMv7 vexpress-a9 in QEMU) ────────────────┐
+108 | │  gdbserver :1234 ./buggy_app                                  │
+109 | │  strace -o /tmp/trace.txt ./app                               │
+110 | └───────────────────────────────────────────────────────────────┘
+113 | IV. Hướng dẫn thực hành
+114 | PHẦN A – Remote Debugging với GDB và gdbserver
+115 | Mục tiêu: Debug một ứng dụng C ARM có bug cố ý chạy trong QEMU, kết nối từ GDB host, đặt breakpoint, quan sát call stack và tìm ra nguyên nhân crash
+117 | A.1. Viết ứng dụng có bug cố ý (buggy_app.c)
+118 | Ứng dụng sau có 3 bug cố ý: null pointer dereference, array out-of-bounds, và integer overflow. Nhiệm vụ của sinh viên là dùng GDB tìm ra từng bug.
+120 | mkdir -p ~/embedded_lab3/apps
+121 | cat > ~/embedded_lab3/apps/buggy_app.c << 'EOF'
+122 | #include <stdio.h>
+123 | #include <stdlib.h>
+124 | #include <string.h>
+126 | /* Bug 1: Null pointer dereference */
+127 | void process_data(int *data, int len) {
+128 |     int sum = 0;
+129 |     for (int i = 0; i <= len; i++) {   /* Bug: <= thay vi < */
+130 |         sum += data[i];                 /* Out-of-bounds khi i==len */
+131 |     }
+132 |     printf("Sum = %d\n", sum);
+133 | }
+135 | /* Bug 2: Use after free */
+136 | char *create_message(const char *text) {
+137 |     char *buf = malloc(strlen(text) + 1);
+138 |     strcpy(buf, text);
+139 |     free(buf);
+140 |     return buf;   /* Bug: tra ve pointer da bi free */
+141 | }
+143 | /* Bug 3: Integer overflow */
+144 | int calculate(int a, int b) {
+145 |     int result = a * b;   /* Bug: a*b co the overflow int */
+146 |     printf("calculate(%d, %d) = %d\n", a, b, result);
+147 |     return result;
+148 | }
+150 | int main(int argc, char *argv[]) {
+151 |     printf("=== Buggy App v1.0 – LAB-03 Debug Target ===\n");
+153 |     /* Test 1: array processing */
+154 |     int arr[5] = {10, 20, 30, 40, 50};
+155 |     printf("[TEST1] Processing array of 5 elements\n");
+156 |     process_data(arr, 5);   /* Bug: truyen len=5, loop den i=5 */
+158 |     /* Test 2: string message */
+159 |     printf("[TEST2] Creating message\n");
+160 |     char *msg = create_message("Hello Embedded Linux");
+161 |     printf("Message: %s\n", msg);  /* Use after free */
+163 |     /* Test 3: integer overflow */
+164 |     printf("[TEST3] Integer calculation\n");
+165 |     calculate(100000, 100000);  /* 10^10 > INT_MAX (2^31-1) */
+167 |     printf("Done.\n");
+168 |     return 0;
+169 | }
+170 | EOF
+172 | A.2. Cross-compile với debug symbols
+173 | Phải compile với -g để GDB có thể ánh xạ địa chỉ sang dòng source code, và -O0 để tắt optimization (tránh GDB bị nhảy dòng).
+175 | cd ~/embedded_lab3/apps
+176 | arm-linux-gnueabihf-gcc \
+177 |     -g -O0 \
+178 |     # -g: debug symbols, -O0: no optimization
+179 |     -march=armv7-a -mfpu=neon-vfpv3 -mfloat-abi=hard \
+180 |     # Target ARMv7 Cortex-A9
+181 |     -o buggy_app buggy_app.c
+183 | file buggy_app
+184 | # Mong đợi: ELF 32-bit LSB executable, ARM, EABI5, not stripped
+185 | arm-linux-gnueabihf-size buggy_app
+186 | # Xem kích thước các section: text, data, bss
+188 | Copy binary vào rootfs
+189 | cp buggy_app ~/embedded_lab3/rootfs/initramfs/usr/bin/
+191 | A.3. Boot QEMU với port forwarding cho GDB
+192 | Cần thêm tùy chọn network vào QEMU để host GDB có thể kết nối vào gdbserver chạy trong QEMU qua TCP port 1234.
+194 | Đóng gói initramfs LAB-03
+195 | cd ~/embedded_lab3/rootfs/initramfs
+196 | find . | cpio -H newc -o | gzip > ~/embedded_lab3/output/initramfs_lab3.cpio.gz
+198 | Boot QEMU – Terminal 1 (chạy QEMU)
+199 | qemu-system-arm \
+200 |   -M vexpress-a9 \
+201 |   -cpu cortex-a9 \
+202 |   -m 512M \
+203 |   -smp 2 \
+204 |   -nographic \
+205 |   -kernel ~/embedded_lab1/output/zImage \
+206 |   -dtb ~/embedded_lab1/output/vexpress-v2p-ca9.dtb \
+207 |   -initrd ~/embedded_lab3/output/initramfs_lab3.cpio.gz \
+208 |   -append 'console=ttyAMA0,115200 rdinit=/sbin/init mem=512M' \
+209 |   -net nic -net user,hostfwd=tcp::1234-:1234
+210 |   # hostfwd: forward port 1234 host → port 1234 trong QEMU
+212 | 📌 Lưu ý: Mở 2 terminal riêng biệt: Terminal 1 chạy QEMU (giữ session), Terminal 2 chạy GDB trên host. Không đóng Terminal 1 trong suốt Phần A.
+214 | A.4. Khởi động gdbserver trên target
+215 | Sau khi QEMU boot xong, trong BusyBox shell chạy:
+217 | # Trong QEMU shell (Terminal 1):
+218 | gdbserver :1234 /usr/bin/buggy_app
+220 | Process /usr/bin/buggy_app created; pid = 42
+221 | Listening on port 1234
+223 | 📌 Lưu ý: gdbserver treo chờ kết nối từ GDB host. QEMU vẫn đang chạy. Chuyển sang Terminal 2 trên host để tiến hành debug.
+225 | A.5. Kết nối GDB từ Host và Debug
+226 | Khởi động GDB – Terminal 2 (Host)
+227 | # Trên HOST, Terminal 2:
+228 | cd ~/embedded_lab3/apps
+229 | gdb-multiarch buggy_app
+231 | Trong GDB shell – thiết lập và kết nối
+232 | (gdb) set architecture arm
+233 | # Chỉ định kiến trúc ARM cho GDB
+234 | (gdb) set sysroot ~/embedded_lab3/rootfs/initramfs
+235 | # Trỏ GDB đến rootfs để tìm shared libraries nếu cần
+236 | (gdb) target remote localhost:1234
+237 | # Kết nối đến gdbserver trong QEMU
+239 | Remote debugging using localhost:1234
+240 | 0x76fff090 in ?? ()
+242 | Đặt breakpoint và quan sát
+243 | (gdb) break main
+244 | # Breakpoint tại hàm main
+245 | (gdb) break process_data
+246 | # Breakpoint tại hàm có bug 1
+247 | (gdb) break create_message
+248 | (gdb) continue
+249 | # Chạy đến breakpoint đầu tiên
+251 | (gdb) info breakpoints
+252 | # Liệt kê tất cả breakpoints
+253 | (gdb) backtrace
+254 | # (hoặc bt) – xem call stack hiện tại
+255 | (gdb) info locals
+256 | # Xem tất cả biến local của frame hiện tại
+257 | (gdb) print arr
+258 | # In giá trị biến arr
+259 | (gdb) print arr[0]@5
+260 | # In 5 phần tử từ arr[0]
+262 | Bắt lỗi Bug 1 – Array out-of-bounds
+263 | (gdb) continue
+264 | # Chạy đến process_data
+265 | (gdb) next
+266 | # Step over từng dòng
+267 | (gdb) print i
+268 | # Quan sát giá trị i khi loop
+269 | (gdb) watch i
+270 | # Đặt watchpoint: dừng khi i thay đổi
+271 | (gdb) print &arr[5]
+272 | # Xem địa chỉ của arr[5] – out-of-bounds!
+274 | Bắt lỗi Bug 2 – Use after free
+275 | (gdb) continue
+276 | (gdb) next
+277 | # Step qua free(buf)
+278 | (gdb) print buf
+279 | # Địa chỉ vẫn còn nhưng vùng nhớ đã free
+280 | (gdb) x/s buf
+281 | # Examine memory as string – nội dung không xác định
+283 | Xem registers ARM
+284 | (gdb) info registers
+285 | # Xem tất cả ARM registers: r0-r15, sp, lr, pc, cpsr
+286 | (gdb) info registers pc sp lr
+287 | # Xem Program Counter, Stack Pointer, Link Register
+289 | Thoát GDB
+290 | (gdb) quit
+292 | Ghi lại vào báo cáo: địa chỉ của bug, giá trị biến tại thời điểm crash, call stack và mô tả nguyên nhân từng bug.
+295 | PHẦN B – Phân tích Memory Leak với Valgrind
+296 | Mục tiêu: Viết ứng dụng có memory leak cố ý, chạy Valgrind để phát hiện chính xác vị trí leak, đo lượng bộ nhớ bị mất và giải thích cơ chế
+298 | ⚠ Cảnh báo: Valgrind chạy trực tiếp trên HOST với ứng dụng được compile cho x86_64 (không qua QEMU). Đây là workflow phổ biến trong embedded: debug logic trên host trước, sau đó cross-compile cho target.
+300 | B.1. Viết ứng dụng có memory leak cố ý
+301 | cat > ~/embedded_lab3/apps/leaky_app.c << 'EOF'
+302 | #include <stdio.h>
+303 | #include <stdlib.h>
+304 | #include <string.h>
+306 | #define NUM_RECORDS  100
+307 | #define MSG_SIZE     256
+309 | typedef struct {
+310 |     int  id;
+311 |     char *name;     /* Heap allocated – dễ bị quên free */
+312 |     int  *scores;   /* Heap allocated – dễ bị quên free */
+313 | } Record;
+315 | /* Leak 1: name không được free khi record bị xóa */
+316 | Record *create_record(int id, const char *name, int num_scores) {
+317 |     Record *r = malloc(sizeof(Record));
+318 |     r->id     = id;
+319 |     r->name   = malloc(strlen(name) + 1);
+320 |     strcpy(r->name, name);
+321 |     r->scores = malloc(sizeof(int) * num_scores);
+322 |     for (int i = 0; i < num_scores; i++)
+323 |         r->scores[i] = id * 10 + i;
+324 |     return r;
+325 | }
+327 | /* Bug: free record nhưng QUÊN free r->name và r->scores */
+328 | void delete_record(Record *r) {
+329 |     /* free(r->name);   <-- BỊ COMMENT = memory leak */
+330 |     /* free(r->scores); <-- BỊ COMMENT = memory leak */
+331 |     free(r);
+332 | }
+334 | /* Leak 2: Buffer trong vòng lặp không được free */
+335 | void process_messages(int count) {
+336 |     for (int i = 0; i < count; i++) {
+337 |         char *buf = malloc(MSG_SIZE);
+338 |         snprintf(buf, MSG_SIZE, "Message #%d: data payload here", i);
+339 |         /* Xử lý xong nhưng QUÊN free(buf) */
+340 |         if (i % 10 == 0)
+341 |             printf("  Processed: %s\n", buf);
+342 |         /* free(buf);  <-- BỊ THIẾU */
+343 |     }
+344 | }
+346 | int main(void) {
+347 |     printf("=== Leaky App – LAB-03 Memory Analysis ===\n");
+349 |     printf("[1] Creating %d records...\n", NUM_RECORDS);
+350 |     Record **records = malloc(sizeof(Record*) * NUM_RECORDS);
+351 |     for (int i = 0; i < NUM_RECORDS; i++)
+352 |         records[i] = create_record(i, "EmbeddedLinuxStudent", 5);
+354 |     printf("[2] Deleting records (with leak)...\n");
+355 |     for (int i = 0; i < NUM_RECORDS; i++)
+356 |         delete_record(records[i]);
+357 |     free(records);
+359 |     printf("[3] Processing messages (with leak)...\n");
+360 |     process_messages(50);
+362 |     printf("Program finished – check valgrind output!\n");
+363 |     return 0;
+364 | }
+365 | EOF
+367 | B.2. Compile cho Host (x86_64) với debug symbols
+368 | cd ~/embedded_lab3/apps
+369 | gcc -g -O0 -o leaky_app leaky_app.c
+370 | # Compile cho host x86_64 (không cross-compile)
+371 | file leaky_app
+372 | # Mong đợi: ELF 64-bit LSB executable, x86-64
+374 | B.3. Chạy Valgrind – Memcheck
+375 | Valgrind chạy chương trình trong môi trường ảo hóa và theo dõi toàn bộ thao tác bộ nhớ. Tốc độ chậm hơn ~10-50x nhưng cực kỳ chính xác.
+377 | Chạy Valgrind cơ bản
+378 | valgrind --tool=memcheck ./leaky_app
+380 | Chạy Valgrind đầy đủ – bắt được tất cả leak
+381 | valgrind \
+382 |   --tool=memcheck \
+383 |   --leak-check=full \
+384 |   # Hiển thị chi tiết từng leak
+385 |   --show-leak-kinds=all \
+386 |   # Hiển thị: definite, indirect, possible, reachable
+387 |   --track-origins=yes \
+388 |   # Tìm nguồn gốc của uninitialised value
+389 |   --verbose \
+390 |   --log-file=~/embedded_lab3/logs/valgrind_report.txt \
+391 |   ./leaky_app
+393 | Phân tích output của Valgrind – các thông tin quan trọng cần ghi vào báo cáo:
+395 | Cấu trúc báo cáo Valgrind cần đọc
+396 | ==PID== HEAP SUMMARY:
+397 | ==PID==     in use at exit: X bytes in Y blocks
+398 | # Tổng bộ nhớ bị leak khi chương trình kết thúc
+399 | ==PID==   total heap usage: A allocs, B frees, C bytes allocated
+400 | # Số lần malloc vs free – phải bằng nhau nếu không có leak
+401 | ==PID==
+402 | ==PID== LEAK SUMMARY:
+403 | ==PID==    definitely lost: X bytes in Y blocks
+404 | # Leak chắc chắn – pointer bị mất hoàn toàn
+405 | ==PID==    indirectly lost: X bytes in Y blocks
+406 | # Leak gián tiếp – do struct cha bị leak
+407 | ==PID==      possibly lost: X bytes in Y blocks
+408 | # Có thể là leak – pointer bị dịch chuyển
+410 | Đọc chi tiết một leak cụ thể
+411 | ==PID== 2000 bytes in 100 blocks are definitely lost in loss record 2 of 3
+412 | ==PID==    at 0x4C2FB0F: malloc (in /usr/lib/valgrind/...)
+413 | ==PID==    by 0x10896B: create_record (leaky_app.c:12)
+414 | # <- Dòng 12 trong leaky_app.c: r->name = malloc(...)
+415 | ==PID==    by 0x1089F2: main (leaky_app.c:42)
+416 | # <- Được gọi từ dòng 42 trong main
+418 | 📌 Lưu ý: Đọc từ dưới lên: dòng dưới cùng là nơi gọi malloc (nguồn gốc leak), dòng trên là caller, cứ thế lên đến main. Đây là allocation stack trace – cực kỳ quan trọng để tìm bug.
+420 | B.4. Sửa bug và kiểm tra lại
+421 | Sửa file leaky_app.c: bỏ comment các dòng free() bị thiếu, rồi compile và chạy Valgrind lại.
+423 | # Sửa hàm delete_record – bỏ comment 2 dòng free:
+424 | # free(r->name);
+425 | # free(r->scores);
+427 | # Sửa hàm process_messages – thêm free(buf) sau khi dùng xong
+429 | gcc -g -O0 -o leaky_app_fixed leaky_app.c
+430 | valgrind --leak-check=full ./leaky_app_fixed
+431 | # Mong đợi: 'All heap blocks were freed -- no leaks are possible'
+433 | ✔ Kết quả mong đợi: Output cuối Valgrind sau khi sửa: 'ERROR SUMMARY: 0 errors from 0 contexts'. Tổng allocs phải bằng tổng frees.
+435 | B.5. Đo memory usage với /proc (trên target QEMU)
+436 | Cross-compile leaky_app cho ARM và đo bộ nhớ thực tế trong QEMU bằng /proc/PID/status:
+438 | arm-linux-gnueabihf-gcc -g -O0 -march=armv7-a -mfloat-abi=hard \
+439 |     -o leaky_app_arm leaky_app.c
+440 | cp leaky_app_arm ~/embedded_lab3/rootfs/initramfs/usr/bin/
+442 | # Trong QEMU shell – chạy và xem memory map:
+443 | # Chạy background để lấy PID
+444 | leaky_app_arm &
+445 | PID=$!
+446 | cat /proc/$PID/status | grep -E 'VmRSS|VmSize|VmHeap'
+447 | # VmSize: virtual memory, VmRSS: physical RAM thực sự dùng
+448 | cat /proc/$PID/maps | head -20
+449 | # Xem memory map của process: text, heap, stack, libs
+452 | PHẦN C – Profiling với strace và perf
+453 | Mục tiêu: Dùng strace phân tích system call của ứng dụng, và perf để tìm CPU hotspot. Xác định bottleneck hiệu năng trong một ứng dụng tính toán nặng
+455 | C.1. Viết ứng dụng để profiling
+456 | cat > ~/embedded_lab3/apps/perf_target.c << 'EOF'
+457 | #include <stdio.h>
+458 | #include <stdlib.h>
+459 | #include <string.h>
+460 | #include <math.h>
+461 | #include <time.h>
+463 | #define ARRAY_SIZE  100000
+464 | #define ITERATIONS  50
+466 | /* Hàm tính toán nặng – CPU bound */
+467 | double heavy_compute(double *arr, int n) {
+468 |     double result = 0.0;
+469 |     for (int i = 0; i < n; i++) {
+470 |         result += sqrt(arr[i]) * log(arr[i] + 1.0);
+471 |     }
+472 |     return result;
+473 | }
+475 | /* Hàm tìm kiếm tuyến tính – O(n) */
+476 | int linear_search(int *arr, int n, int target) {
+477 |     for (int i = 0; i < n; i++)
+478 |         if (arr[i] == target) return i;
+479 |     return -1;
+480 | }
+482 | /* Hàm I/O – nhiều system call */
+483 | void io_intensive(int count) {
+484 |     FILE *f = fopen("/tmp/perf_test.txt", "w");
+485 |     for (int i = 0; i < count; i++)
+486 |         fprintf(f, "Line %d: measurement data\n", i);
+487 |     fclose(f);
+488 | }
+490 | int main(void) {
+491 |     printf("=== Perf Target App – LAB-03 ===\n");
+493 |     /* Khởi tạo array */
+494 |     double *darr = malloc(sizeof(double) * ARRAY_SIZE);
+495 |     int    *iarr = malloc(sizeof(int)    * ARRAY_SIZE);
+496 |     for (int i = 0; i < ARRAY_SIZE; i++) {
+497 |         darr[i] = (double)(i + 1);
+498 |         iarr[i] = i;
+499 |     }
+501 |     printf("[1] CPU-intensive computation...\n");
+502 |     double total = 0;
+503 |     for (int iter = 0; iter < ITERATIONS; iter++)
+504 |         total += heavy_compute(darr, ARRAY_SIZE);
+505 |     printf("    Result: %f\n", total);
+507 |     printf("[2] Linear search (1000 times)...\n");
+508 |     for (int i = 0; i < 1000; i++)
+509 |         linear_search(iarr, ARRAY_SIZE, ARRAY_SIZE - 1);
+511 |     printf("[3] I/O intensive (write 10000 lines)...\n");
+512 |     io_intensive(10000);
+514 |     free(darr); free(iarr);
+515 |     printf("Done.\n");
+516 |     return 0;
+517 | }
+518 | EOF
+520 | C.2. Phân tích System Call với strace
+521 | strace chạy trực tiếp trên HOST với binary x86_64. Mục tiêu là hiểu pattern I/O và system call của ứng dụng.
+523 | cd ~/embedded_lab3/apps
+524 | gcc -g -O1 -o perf_target perf_target.c -lm
+525 | # Compile cho host, -O1 để có hiệu năng thực tế, -lm cho math
+527 | Chạy strace – xem tất cả system call
+528 | strace -o ~/embedded_lab3/logs/strace_full.txt ./perf_target
+529 | wc -l ~/embedded_lab3/logs/strace_full.txt
+530 | # Đếm tổng số system call được gọi
+532 | Thống kê system call theo tần suất
+533 | strace -c -o ~/embedded_lab3/logs/strace_summary.txt ./perf_target
+534 | cat ~/embedded_lab3/logs/strace_summary.txt
+536 | Output của strace -c cần đọc hiểu:
+537 | % time     seconds  usecs/call     calls    errors syscall
+538 | ------  ----------  -----------  -------  -------- ----------------
+539 |  72.34    0.045123         4512       10         0 write
+540 | # write chiếm 72% thời gian – I/O là bottleneck!
+541 |   8.12    0.005067           5     1013         0 fstat
+542 |   ...
+544 | Theo dõi chỉ các call liên quan đến file
+545 | strace -e trace=file,write,read ./perf_target 2>&1 | head -30
+546 | # Lọc: chỉ hiện file-related syscalls
+548 | Đo thời gian thực thi
+549 | time ./perf_target
+550 | # real: wall clock time, user: CPU time in userspace, sys: CPU time in kernel
+552 | C.3. CPU Profiling với perf (trên Host)
+553 | perf sử dụng hardware performance counters của CPU để lấy mẫu (sampling) và xác định hàm nào tiêu tốn nhiều CPU nhất.
+555 | Bước 1: Thu thập dữ liệu profiling
+556 | sudo perf record -g -o ~/embedded_lab3/logs/perf.data ./perf_target
+557 | # -g: ghi call graph (flame graph), output vào perf.data
+559 | Bước 2: Xem báo cáo profiling
+560 | sudo perf report -i ~/embedded_lab3/logs/perf.data --stdio \
+561 |     > ~/embedded_lab3/logs/perf_report.txt
+562 | head -40 ~/embedded_lab3/logs/perf_report.txt
+564 | Cấu trúc output của perf report cần đọc hiểu:
+565 | # Overhead  Command      Shared Object     Symbol
+566 | # ........  ...........  ................  ........................
+567 | #   45.23%  perf_target  perf_target       [.] heavy_compute
+568 | #                                        ^^ 45% CPU ở hàm này!
+569 | #   28.11%  perf_target  libm.so.6         [.] __ieee754_sqrt_sse2
+570 | #   12.05%  perf_target  perf_target       [.] linear_search
+572 | Bước 3: Xem perf stat – tổng quan counters
+573 | sudo perf stat ./perf_target 2>&1 | tee ~/embedded_lab3/logs/perf_stat.txt
+575 | Các counter quan trọng trong perf stat:
+576 | task-clock: CPU time thực sự dùng (ms)
+577 | cache-misses: số lần cache miss – cao = memory access pattern kém
+578 | branch-misses: số lần branch prediction sai – ảnh hưởng pipeline
+579 | instructions per cycle (IPC): > 1.5 là tốt, < 0.5 là có vấn đề
+581 | Bước 4 (Bonus): Tạo Flame Graph
+582 | # Cài FlameGraph tool
+583 | git clone https://github.com/brendangregg/FlameGraph ~/FlameGraph
+585 | sudo perf record -F 99 -g -o perf_flame.data ./perf_target
+586 | sudo perf script -i perf_flame.data > perf_out.txt
+587 | ~/FlameGraph/stackcollapse-perf.pl perf_out.txt > perf_folded.txt
+588 | ~/FlameGraph/flamegraph.pl perf_folded.txt > ~/embedded_lab3/logs/flamegraph.svg
+589 | # Mở flamegraph.svg trong browser để xem visualisation
+591 | C.4. Profiling trên ARM target (QEMU)
+592 | Cross-compile perf_target cho ARM và dùng strace trong QEMU để quan sát system call trên kiến trúc ARM thực tế.
+594 | arm-linux-gnueabihf-gcc -g -O1 -march=armv7-a -mfloat-abi=hard \
+595 |     -o perf_target_arm perf_target.c -lm
+596 | cp perf_target_arm ~/embedded_lab3/rootfs/initramfs/usr/bin/
+598 | Đóng gói lại initramfs và trong QEMU shell chạy:
+599 | # Trong QEMU:
+600 | time perf_target_arm
+601 | # So sánh thời gian ARM vs x86_64 host
+602 | strace -c perf_target_arm 2>&1
+603 | # Xem system call profile trên ARM
+605 | 📌 Lưu ý: So sánh kết quả strace -c giữa x86_64 host và ARMv7 QEMU. Ghi nhận sự khác biệt về thời gian thực thi và phân bố system call vào báo cáo.
+608 | PHẦN D – Real-Time Analysis: Đo Latency với cyclictest
+609 | Mục tiêu: Đo worst-case latency của hệ thống với standard kernel, phân tích kết quả, sau đó so sánh lý thuyết với PREEMPT_RT patch. Vẽ biểu đồ histogram latency.
+611 | ⚠ Cảnh báo: Phần D thực hiện trên HOST Ubuntu (không qua QEMU) để có kết quả đo latency phản ánh thực tế phần cứng. QEMU không phù hợp để đo real-time latency vì thêm một lớp ảo hóa.
+613 | D.1. Giới thiệu về cyclictest
+614 | cyclictest hoạt động bằng cách tạo một thread với độ ưu tiên cao (SCHED_FIFO), yêu cầu wake-up theo chu kỳ cố định (ví dụ mỗi 1ms), rồi đo sai số giữa thời điểm wake-up mong đợi và thực tế. Sai số này chính là latency.
+617 | D.2. Chạy cyclictest – Standard Kernel
+618 | Bước 1: Kiểm tra thông tin kernel hiện tại
+619 | uname -a
+620 | # Ghi lại: phiên bản kernel, có PREEMPT không?
+621 | uname -r | grep -i preempt || echo 'Standard kernel (no RT patch)'
+622 | cat /boot/config-$(uname -r) | grep -E 'PREEMPT' | head -10
+623 | # Xem cấu hình preemption của kernel hiện tại
+625 | Bước 2: Chạy cyclictest cơ bản
+626 | sudo cyclictest \
+627 |   --mlockall \
+628 |   # Lock all memory – tránh page fault làm tăng latency
+629 |   --threads=4 \
+630 |   # 4 threads (khớp số CPU core)
+631 |   --priority=80 \
+632 |   # Priority SCHED_FIFO = 80 (cao)
+633 |   --interval=1000 \
+634 |   # Chu kỳ đo: 1000 µs = 1ms
+635 |   --distance=500 \
+636 |   # Mỗi thread cách nhau 500µs
+637 |   --loops=10000 \
+638 |   # Số vòng lặp đo = 10000
+639 |   --histogram=200 \
+640 |   # Tạo histogram với 200 buckets
+641 |   --histfile=~/embedded_lab3/logs/hist_standard.txt
+643 | # Mẫu output trong quá trình chạy:
+644 | T: 0 (12345) P:80 I:1000 C:  1000 Min:     12 Act:  18 Avg:  15 Max:    87
+645 | T: 1 (12346) P:80 I:1500 C:  1000 Min:      9 Act:  14 Avg:  13 Max:    62
+647 | 📌 Lưu ý: Trong lúc cyclictest đang chạy, mở terminal khác và chạy các tác vụ nặng để tạo load: 'stress-ng --cpu 4 --io 2 --timeout 30s' hoặc 'dd if=/dev/zero of=/dev/null'. Điều này giúp đo worst-case latency trong điều kiện thực tế.
+649 | Bước 3: Tạo stress load trong khi đo
+650 | # Terminal khác – chạy song song với cyclictest:
+651 | sudo apt install -y stress-ng
+652 | stress-ng --cpu $(nproc) --io 4 --vm 2 --vm-bytes 256M --timeout 60s &
+653 | # Tạo CPU, I/O, và memory pressure
+655 | D.3. Vẽ biểu đồ Histogram Latency bằng gnuplot
+656 | File histogram từ cyclictest chứa phân phối latency dạng: [latency_us] [count_thread0] [count_thread1] ...
+658 | Tạo script gnuplot
+659 | cat > ~/embedded_lab3/logs/plot_latency.gnuplot << 'GNUPLOT_EOF'
+660 | set terminal png size 1200,600
+661 | set output '~/embedded_lab3/logs/latency_histogram.png'
+662 | set title 'Cyclictest Latency Histogram – Standard Kernel'
+663 | set xlabel 'Latency (microseconds)'
+664 | set ylabel 'Number of occurrences'
+665 | set xrange [0:200]
+666 | set grid
+667 | set key top right
+668 | set style fill solid 0.5
+669 | plot '~/embedded_lab3/logs/hist_standard.txt' \
+670 |      using 1:2 with boxes title 'Thread 0' lc rgb '#2E75B6', \
+671 |      '' using 1:3 with boxes title 'Thread 1' lc rgb '#C55A11'
+672 | GNUPLOT_EOF
+674 | gnuplot ~/embedded_lab3/logs/plot_latency.gnuplot
+675 | ls -lh ~/embedded_lab3/logs/latency_histogram.png
+676 | # Mở file PNG để xem histogram
+678 | D.4. Phân tích kết quả và giải thích nguồn gốc latency
+679 | Từ kết quả cyclictest và histogram, phân tích các nguồn gốc gây latency cao:
+681 | Trích xuất thống kê từ histogram file
+682 | # Tìm max latency từ histogram:
+683 | awk 'NR>1 && $2>0 {max=$1} END{print "Max latency:", max, "us"}' \
+684 |     ~/embedded_lab3/logs/hist_standard.txt
+686 | # Tính phần trăm mẫu có latency < 50µs:
+687 | awk 'NR>1{total+=$2; if($1<50) good+=$2} \
+688 |      END{printf "%.1f%% samples < 50us\n", good/total*100}' \
+689 |      ~/embedded_lab3/logs/hist_standard.txt
+691 | Ghi vào báo cáo bảng so sánh sau:
+694 | D.5. So sánh lý thuyết với PREEMPT_RT Kernel
+695 | Trong phạm vi bài lab này, ta sẽ phân tích lý thuyết về sự khác biệt giữa standard kernel và PREEMPT_RT. Việc build và test RT kernel thực tế là bài tập nâng cao.
+697 | Kiểm tra kernel hiện tại có CONFIG_PREEMPT_RT không
+698 | grep CONFIG_PREEMPT /boot/config-$(uname -r)
+699 | # CONFIG_PREEMPT=y: Desktop Preempt (partial)
+700 | # CONFIG_PREEMPT_RT=y: Full RT (hiếm trên Ubuntu chuẩn)
+702 | Nếu có sẵn RT kernel – cài và so sánh
+703 | sudo apt search linux-image | grep lowlatency
+704 | sudo apt install -y linux-image-lowlatency linux-headers-lowlatency
+705 | # lowlatency kernel có PREEMPT config tốt hơn standard
+707 | # Sau khi reboot vào lowlatency kernel:
+708 | uname -r
+709 | # Xác nhận đang dùng lowlatency kernel
+710 | sudo cyclictest --mlockall --threads=4 --priority=80 \
+711 |   --interval=1000 --loops=10000 \
+712 |   --histogram=200 \
+713 |   --histfile=~/embedded_lab3/logs/hist_lowlatency.txt
+715 | Kết quả mong đợi khi so sánh:
+719 | V. Yêu cầu nộp bài
+720 | 5.1. Cấu trúc thư mục nộp bài
+721 | Nén toàn bộ thành file: MSSV_HoTen_Lab03.tar.gz với cấu trúc sau:
+723 | MSSV_HoTen_Lab03/
+724 | ├── apps/
+725 | │   ├── buggy_app.c              # Source code (ARM, có debug symbols)
+726 | │   ├── buggy_app                # Binary ARM ELF
+727 | │   ├── leaky_app.c              # Source code (có bug và bản đã sửa)
+728 | │   ├── leaky_app                # Binary x86_64 (chưa sửa)
+729 | │   ├── leaky_app_fixed          # Binary x86_64 (đã sửa)
+730 | │   └── perf_target.c            # Source code profiling target
+731 | ├── output/
+732 | │   └── initramfs_lab3.cpio.gz   # initramfs boot được trên QEMU
+733 | ├── logs/
+734 | │   ├── gdb_session.txt          # GDB session log (copy từ terminal)
+735 | │   ├── valgrind_report.txt      # Valgrind full output (trước khi sửa)
+736 | │   ├── valgrind_fixed.txt       # Valgrind output sau khi sửa
+737 | │   ├── strace_summary.txt       # strace -c output
+738 | │   ├── perf_report.txt          # perf report output
+739 | │   ├── perf_stat.txt            # perf stat output
+740 | │   ├── hist_standard.txt        # Histogram data từ cyclictest
+741 | │   └── latency_histogram.png    # Biểu đồ gnuplot
+742 | └── bao_cao/
+743 |     └── MSSV_Lab03_BaoCao.pdf
+745 | 5.2. Yêu cầu báo cáo
+747 | Mục 1: Thông tin sinh viên và môi trường
+748 | Họ và tên, MSSV, ngày thực hiện, phiên bản kernel host, phiên bản GDB, Valgrind, perf.
+750 | Mục 2: Phần A – GDB Debug Report (BẮT BUỘC)
+751 | Mô tả 3 bug tìm được: tên bug, vị trí (file:dòng), giá trị biến tại thời điểm lỗi, nguyên nhân kỹ thuật.
+752 | Copy toàn bộ GDB session log: từ lúc kết nối đến lúc phát hiện từng bug.
+753 | Screenshot hoặc text của lệnh 'backtrace', 'info registers', 'print' tại điểm crash.
+754 | Đề xuất cách sửa từng bug (không cần thực sự sửa – chỉ cần giải thích).
+756 | Mục 3: Phần B – Memory Analysis Report
+757 | Paste toàn bộ LEAK SUMMARY từ Valgrind (trước khi sửa): definitely lost, indirectly lost, total bytes.
+758 | Giải thích allocation stack trace của ít nhất 2 leak: malloc ở đâu, tại sao không được free.
+759 | Output Valgrind sau khi sửa: xác nhận '0 errors from 0 contexts'.
+760 | Bảng so sánh VmRSS của leaky_app_arm trước và sau khi chạy (đọc từ /proc/PID/status trong QEMU).
+762 | Mục 4: Phần C – Profiling Report
+763 | Bảng thống kê strace -c: 5 system call tốn thời gian nhất, % time, số lần gọi.
+764 | Output perf report: 5 hàm tiêu tốn CPU nhất, % overhead, tên shared object.
+765 | Nhận xét: bottleneck của perf_target là CPU hay I/O? Đề xuất cách tối ưu.
+766 | (Bonus) Đính kèm flamegraph.svg nếu đã tạo được.
+768 | Mục 5: Phần D – Real-Time Latency Report (BẮT BUỘC)
+769 | Điền đầy đủ bảng thống kê: Min/Avg/Max latency trên standard kernel.
+770 | Đính kèm file PNG histogram latency từ gnuplot.
+771 | Giải thích: tại sao Max latency quan trọng hơn Avg latency trong hệ thống real-time?
+772 | Giải thích cơ chế PREEMPT_RT giúp giảm Max latency so với standard kernel.
+773 | Đề xuất: hệ thống điều khiển robot với yêu cầu response < 500µs nên dùng kernel nào? Tại sao?
+775 | Mục 6: Trả lời câu hỏi phân tích (Mục VI)
+777 | Mục 7: Nhận xét & Khó khăn
+778 | Mô tả ít nhất 2 khó khăn gặp phải và cách giải quyết.
+780 | 5.3. Tiêu chí đánh giá
+784 | VI. Câu hỏi phân tích
+785 | Trả lời chi tiết các câu hỏi sau trong báo cáo. Mỗi câu 3 điểm trong tổng 15 điểm:
+787 | Câu 1.  Trong Phần A, GDB remote debugging sử dụng mô hình client-server: GDB (host) là client, gdbserver (target) là server. Giải thích: khi bạn gõ lệnh 'next' trong GDB, chuỗi sự kiện gì xảy ra từ host đến QEMU ARMv7 và ngược lại? Giao thức nào được dùng giữa GDB và gdbserver? Tại sao cần dùng gdb-multiarch thay vì gdb thông thường khi debug ARM từ host x86_64?
+788 | Câu 2.  Valgrind báo 'definitely lost' và 'indirectly lost' khác nhau như thế nào? Trong leaky_app.c, khi delete_record() không free r->name và r->scores trước khi free(r), thì r->name bị báo là 'definitely lost' hay 'indirectly lost'? Giải thích tại sao. Ngoài memory leak, Valgrind còn phát hiện được loại lỗi bộ nhớ nào khác? Liệt kê ít nhất 3 loại.
+789 | Câu 3.  Từ kết quả perf report của Phần C, hàm heavy_compute() chiếm phần lớn CPU time. Đề xuất ít nhất 2 phương án tối ưu hóa hàm này (gợi ý: xem xét SIMD/NEON instructions trên ARMv7, loop unrolling, cache locality). Với mỗi phương án, giải thích cơ chế hoạt động và ước tính mức độ cải thiện có thể đạt được.
+790 | Câu 4.  Kết quả cyclictest cho thấy Max latency cao hơn Avg latency nhiều lần. Giải thích ít nhất 3 nguyên nhân trong standard kernel gây ra các 'latency spike' đột biến này (gợi ý: interrupt handling, scheduler, memory management). PREEMPT_RT patch giải quyết từng nguyên nhân đó như thế nào cụ thể?
+791 | Câu 5.  Trong một dự án embedded thực tế có 4 loại vấn đề sau: (a) ứng dụng bị crash ngẫu nhiên sau vài giờ chạy, (b) ứng dụng chạy ngày càng chậm dần theo thời gian, (c) hệ thống điều khiển đôi khi bỏ lỡ deadline quan trọng, (d) một hàm cụ thể làm cả hệ thống chậm. Với mỗi vấn đề, hãy chọn công cụ phù hợp nhất từ bài lab (GDB, Valgrind, strace, perf, cyclictest) và giải thích lý do chọn.
+793 | 📌 Lưu ý: Câu trả lời cần kết hợp lý thuyết và kết quả quan sát thực tế trong bài lab. Câu trả lời thuần lý thuyết không đạt điểm tối đa.
+796 | VII. Phụ lục – Tài liệu tham khảo & Debug
+797 | 7.1. Tài liệu tham khảo
+798 | Embedded Linux Primer (2nd Ed.) – Chapters 16, 17, 18, 19
+799 | GDB Documentation: sourceware.org/gdb/documentation/
+800 | Valgrind User Manual: valgrind.org/docs/manual/
+801 | perf Wiki: perf.wiki.kernel.org/index.php/Main_Page
+802 | Brendan Gregg – Systems Performance (2nd Ed.): brendangregg.com
+803 | PREEMPT_RT Wiki: wiki.linuxfoundation.org/realtime/documentation/
+804 | cyclictest man page: man cyclictest
+806 | 7.2. Lỗi thường gặp và cách xử lý
+809 | 7.3. Lệnh GDB hay dùng – Bảng tham khảo nhanh
+812 | 7.4. Lệnh debug hữu ích – Các công cụ khác
+814 | Xem memory map chi tiết của process
+815 | cat /proc/$(pgrep buggy_app)/maps
+816 | # Xem: text, heap, stack, shared libs, địa chỉ virtual
+818 | Đo thời gian thực thi chính xác
+819 | time ./perf_target
+820 | /usr/bin/time -v ./perf_target
+821 | # -v: verbose – thêm Maximum resident set size, Page faults...
+823 | Xem system call realtime của một process đang chạy
+824 | sudo strace -p $(pgrep perf_target) -e trace=all
+825 | # Attach vào process đang chạy theo PID
+827 | Kiểm tra realtime capability của kernel
+828 | sudo cyclictest --help | grep -A5 'policy'
+829 | chrt -m
+830 | # Xem max priority của SCHED_FIFO trên hệ thống hiện tại
+832 | So sánh nhanh hai histogram cyclictest
+833 | paste ~/embedded_lab3/logs/hist_standard.txt \
+834 |       ~/embedded_lab3/logs/hist_lowlatency.txt \
+835 | | awk '{print $1, $2, $4}' > /tmp/compare.txt
+836 | # Column 1: latency, Column 2: standard count, Column 3: RT count
